@@ -14,28 +14,33 @@
 - `timeout`
 - `sudo` access
 - `arping` (optional)
+- `curl` (installation only)
+
+## Install
+
+
+```bash
+mkdir -p "$HOME/.local/bin"
+curl -fsSL https://raw.githubusercontent.com/Mgldvd/scanlan/master/scanlan -o "$HOME/.local/bin/scanlan"
+chmod +x "$HOME/.local/bin/scanlan"
+scanlan --help
+```
 
 ## Run
 
-1. Make the script executable.
+1. Start the interactive scanner.
 
 ```bash
-chmod +x scanlan
+scanlan
 ```
 
-2. Start the interactive scanner.
+2. Mark or unmark networks with Space.
 
-```bash
-./scanlan
-```
+3. Start scanning the selected networks with Enter.
 
-3. Mark or unmark networks with Space.
+4. Mark or unmark discovered IP addresses with Space.
 
-4. Start scanning the selected networks with Enter.
-
-5. Mark or unmark discovered IP addresses with Space.
-
-6. Start the optional TCP port scans with Enter.
+5. Start the optional TCP port scans with Enter.
 
 ## How it works
 
@@ -66,31 +71,31 @@ Check the `NOTE` column for the exact precheck result.
 Scan a specific network.
 
 ```bash
-./scanlan 10.10.10.0/24
+scanlan 10.10.10.0/24
 ```
 
 Choose the maximum scan time interactively.
 
 ```bash
-./scanlan --maxtime
+scanlan --maxtime
 ```
 
 Set the maximum scan time directly.
 
 ```bash
-./scanlan --maxtime 180
+scanlan --maxtime 180
 ```
 
 Set the maximum scan time and scan a specific network.
 
 ```bash
-./scanlan --maxtime 180 10.10.10.0/24
+scanlan --maxtime 180 10.10.10.0/24
 ```
 
 Show command help.
 
 ```bash
-./scanlan --help
+scanlan --help
 ```
 
 Allowed maximum times: `60`, `120`, `180`, `240`, and `300` seconds. The default is `120` seconds per network or host.
