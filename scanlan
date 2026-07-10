@@ -23,17 +23,33 @@ require_cmd() {
   }
 }
 
+print_step_title() {
+  local step="$1"
+  local title="$2"
+  local subtitle="$3"
+
+  gum style \
+    --border double \
+    --border-foreground 51 \
+    --foreground 213 \
+    --bold \
+    --padding "0 2" \
+    --margin "1 0" \
+    -- "STEP $step · $title" "$subtitle"
+}
+
 for cmd in nmap gum awk ip mktemp sort timeout; do
   require_cmd "$cmd"
 done
 
 TMP_FILE="$(mktemp)"
 SCAN_STATUS_FILE="$(mktemp)"
+ALL_NETWORK_SCAN_FILE="$(mktemp)"
 DISCOVERED_HOSTS_FILE="$(mktemp)"
 PORT_SCAN_FILE="$(mktemp)"
 PORT_SCAN_STATUS_FILE="$(mktemp)"
 ALL_PORT_SCAN_FILE="$(mktemp)"
-trap 'rm -f "$TMP_FILE" "$SCAN_STATUS_FILE" "$DISCOVERED_HOSTS_FILE" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE" "$ALL_PORT_SCAN_FILE"' EXIT
+trap 'rm -f "$TMP_FILE" "$SCAN_STATUS_FILE" "$ALL_NETWORK_SCAN_FILE" "$DISCOVERED_HOSTS_FILE" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE" "$ALL_PORT_SCAN_FILE"' EXIT
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -397,83 +413,95 @@ run_scan_with_countdown() {
     "$network" "$scan_number" "$scan_total"
 }
 
-print_scan_report() {
+append_network_scan_results() {
   local network="$1"
   local scan_result="$2"
   local tmp_file="$3"
-  local host_count=0
+  local status_label ip mac vendor
 
-  if [[ -s "$tmp_file" ]]; then
-    host_count="$(wc -l < "$tmp_file" | tr -d ' ')"
+  case "$scan_result" in
+    ok) status_label="COMPLETED" ;;
+    timeout) status_label="TIMEOUT" ;;
+    error:*) status_label="ERROR ${scan_result#error:}" ;;
+  esac
+
+  if [[ -s "$ALL_NETWORK_SCAN_FILE" ]]; then
+    printf '%s\n' '||||' >> "$ALL_NETWORK_SCAN_FILE"
   fi
 
-  {
-    gum style --foreground 213 --bold -- "Network Scan Report"
-    echo
-    gum style --foreground 51 --bold -- "Network: $network"
-    gum style --foreground 213 --bold -- "Max scan time: ${MAXTIME}s"
-    gum style --foreground 213 --bold -- "Hosts found: $host_count"
-    echo
+  if [[ -s "$tmp_file" ]]; then
+    while read -r ip mac vendor; do
+      printf '%s|%s|%s|%s|%s\n' \
+        "$network" "$ip" "$mac" "$vendor" "$status_label"
+    done < "$tmp_file" >> "$ALL_NETWORK_SCAN_FILE"
+  else
+    printf '%s|-|-|NO HOSTS|%s\n' "$network" "$status_label" \
+      >> "$ALL_NETWORK_SCAN_FILE"
+  fi
+}
 
-    case "$scan_result" in
-      ok)
-        gum style --foreground 82 --bold -- "Scan completed successfully."
-        ;;
-      timeout)
-        gum style --foreground 214 --bold -- "Scan stopped after ${MAXTIME}s timeout."
-        gum style --foreground 240 -- "Partial results are shown below, if any were found."
-        ;;
-      error:*)
-        gum style --foreground 196 --bold -- "Scan ended with an error (${scan_result#error:})."
-        gum style --foreground 240 -- "Partial results are shown below, if any were found."
-        ;;
-    esac
-    echo
+print_combined_network_scan_report() {
+  local network_total="$1"
+  local host_total
+  host_total="$(awk -F '|' '$2 != "" && $2 != "-" {count++} END {print count + 0}' \
+    "$ALL_NETWORK_SCAN_FILE")"
 
-    if [[ -s "$tmp_file" ]]; then
-      while read -r ip mac vendor; do
-        printf '%s|%s|%s\n' "$ip" "$mac" "$vendor"
-      done < "$tmp_file" \
-        | gum table \
-            --print \
-            --separator '|' \
-            --columns "IP ADDRESS,MAC ADDRESS,VENDOR" \
-            --widths "18,20,42" \
-            --border rounded \
-            --border.foreground 39 \
-            --header.foreground 226 \
-            --cell.foreground 252
-    else
-      gum style --foreground 214 -- "No hosts were found on this network."
-      gum style --foreground 240 -- "Try another network, increase max time, or verify connectivity."
-    fi
-  } | gum style \
-        --border rounded \
-        --border-foreground 51 \
-        --padding "1 2" \
-        --margin "1 0"
+  echo
+  gum style --foreground 213 --bold -- "Network Scan Report"
+  gum style --foreground 51 -- \
+    "Networks scanned: $network_total · Hosts found: $host_total · Max time per network: ${MAXTIME}s"
+  echo
+  gum table \
+    --print \
+    --separator '|' \
+    --columns "NETWORK,IP ADDRESS,MAC ADDRESS,VENDOR,STATUS" \
+    --widths "22,18,20,32,14" \
+    --border rounded \
+    --border.foreground 51 \
+    --header.foreground 51 \
+    --cell.foreground 252 \
+    < "$ALL_NETWORK_SCAN_FILE"
 }
 
 choose_hosts_for_port_scan() {
-  local options=()
-  local network ip
+  local select_all_label="Select all discovered IPs"
+  local options=("$select_all_label")
+  local network ip selected selected_line menu_height select_all=0
 
   while IFS='|' read -r network ip; do
     [[ -n "${network:-}" && -n "${ip:-}" ]] || continue
     options+=("$ip  [$network]")
   done < <(sort -t '|' -k2,2 -u "$DISCOVERED_HOSTS_FILE")
 
-  printf '%s\n' "${options[@]}" \
-    | gum choose \
+  menu_height=${#options[@]}
+
+  selected="$(
+    printf '%s\n' "${options[@]}" \
+      | gum choose \
         --no-limit \
         --ordered \
-        --header "Select IPs — Space: toggle, Enter: scan ports" \
+        --height "$menu_height" \
+        --header "Select IPs — Space: toggle · Enter: scan ports" \
         --cursor "> " \
         --cursor-prefix "[ ] " \
         --selected-prefix "[x] " \
         --unselected-prefix "[ ] " \
         --cursor.foreground 51 \
         --selected.foreground 82
+  )"
+
+  while IFS= read -r selected_line; do
+    if [[ "$selected_line" == "$select_all_label" ]]; then
+      select_all=1
+      break
+    fi
+  done <<< "$selected"
+
+  if [[ $select_all -eq 1 ]]; then
+    printf '%s\n' "${options[@]:1}"
+  elif [[ -n "$selected" ]]; then
+    printf '%s\n' "$selected"
+  fi
 }
 
 run_port_scan() {
@@ -532,8 +560,8 @@ parse_args "$@"
 
 # --- Precheck phase ---------------------------------------------------------
 
-gum style --foreground 213 --bold -- "Running network precheck..."
-echo
+print_step_title "1" "NETWORK PRECHECK" \
+  "Check local interfaces, routes, gateways, and connectivity"
 
 declare -a PRECHECK_ENTRIES
 run_all_prechecks
@@ -541,6 +569,9 @@ run_all_prechecks
 echo
 
 # --- Network selection ------------------------------------------------------
+
+print_step_title "2" "HOST DISCOVERY" \
+  "Select networks and discover active devices"
 
 declare -a NETWORKS
 if [[ -z "$NETWORK" ]]; then
@@ -570,15 +601,18 @@ for network in "${NETWORKS[@]}"; do
     "$SCAN_NUMBER" "$SCAN_TOTAL"
 
   SCAN_RESULT="$(cat "$SCAN_STATUS_FILE")"
-  print_scan_report "$network" "$SCAN_RESULT" "$TMP_FILE"
+  append_network_scan_results "$network" "$SCAN_RESULT" "$TMP_FILE"
   awk -v network="$network" '{print network "|" $1}' "$TMP_FILE" \
     >> "$DISCOVERED_HOSTS_FILE"
 done
 
+print_combined_network_scan_report "$SCAN_TOTAL"
+
 # --- Optional port scan phase ----------------------------------------------
 
 if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
-  echo
+  print_step_title "3" "TCP PORT SCAN" \
+    "Select discovered IPs and inspect their common ports"
   declare -a SELECTED_HOSTS
   mapfile -t SELECTED_HOSTS < <(choose_hosts_for_port_scan)
 

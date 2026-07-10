@@ -38,7 +38,7 @@ scanlan
 
 3. Start scanning the selected networks with Enter.
 
-4. Mark or unmark discovered IP addresses with Space.
+4. Mark individual IP addresses or select `Select all discovered IPs`.
 
 5. Start the optional TCP port scans with Enter.
 
