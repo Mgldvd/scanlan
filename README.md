@@ -6,7 +6,6 @@
 
 - Linux
 - `nmap`
-- `gum`
 - `awk`
 - `ip`
 - `mktemp`

@@ -23,22 +23,187 @@ require_cmd() {
   }
 }
 
+if [[ -t 1 ]]; then
+  C_CYAN=$'\033[38;5;51m'
+  C_MAGENTA=$'\033[38;5;213m'
+  C_GREEN=$'\033[38;5;82m'
+  C_YELLOW=$'\033[38;5;214m'
+  C_RED=$'\033[38;5;196m'
+  C_GRAY=$'\033[38;5;240m'
+  C_BOLD=$'\033[1m'
+  C_RESET=$'\033[0m'
+else
+  C_CYAN="" C_MAGENTA="" C_GREEN="" C_YELLOW="" C_RED=""
+  C_GRAY="" C_BOLD="" C_RESET=""
+fi
+
+message() {
+  local color="$1"
+  shift
+  printf '%s%s%s\n' "$color" "$*" "$C_RESET"
+}
+
+repeat_char() {
+  local char="$1"
+  local count="$2"
+  local output=""
+  while ((count-- > 0)); do
+    output+="$char"
+  done
+  printf '%s' "$output"
+}
+
 print_step_title() {
   local step="$1"
   local title="$2"
   local subtitle="$3"
 
-  gum style \
-    --border double \
-    --border-foreground 51 \
-    --foreground 213 \
-    --bold \
-    --padding "0 2" \
-    --margin "1 0" \
-    -- "STEP $step · $title" "$subtitle"
+  local heading="STEP $step · $title"
+  local width=${#heading}
+  ((${#subtitle} > width)) && width=${#subtitle}
+
+  echo
+  printf '%s%s%s%s\n' "$C_MAGENTA" "$C_BOLD" "$heading" "$C_RESET"
+  printf '%s\n' "$subtitle"
+  printf '%s' "$C_CYAN"
+  repeat_char '─' "$width"
+  printf '%s\n' "$C_RESET"
 }
 
-for cmd in nmap gum awk ip mktemp sort timeout; do
+print_table() {
+  local headers_line="$1"
+  local caps_line="$2"
+  local -a rows headers caps widths fields
+  local row value border i
+
+  mapfile -t rows
+  IFS='|' read -r -a headers <<< "$headers_line"
+  IFS='|' read -r -a caps <<< "$caps_line"
+
+  for ((i = 0; i < ${#headers[@]}; i++)); do
+    widths[i]=${#headers[i]}
+  done
+
+  for row in "${rows[@]}"; do
+    [[ -n "${row//|/}" ]] || continue
+    IFS='|' read -r -a fields <<< "$row"
+    for ((i = 0; i < ${#headers[@]}; i++)); do
+      value="${fields[i]:-}"
+      ((${#value} > widths[i])) && widths[i]=${#value}
+      ((widths[i] > caps[i])) && widths[i]=${caps[i]}
+    done
+  done
+
+  draw_table_border() {
+    local left="$1" middle="$2" right="$3" line
+    printf '%s%s' "$C_CYAN" "$left"
+    for ((i = 0; i < ${#headers[@]}; i++)); do
+      line="$(repeat_char '─' $((widths[i] + 2)))"
+      printf '%s' "$line"
+      ((i + 1 < ${#headers[@]})) && printf '%s' "$middle"
+    done
+    printf '%s%s\n' "$right" "$C_RESET"
+  }
+
+  draw_table_border '╭' '┬' '╮'
+  printf '%s│%s' "$C_CYAN" "$C_RESET"
+  for ((i = 0; i < ${#headers[@]}; i++)); do
+    printf ' %s%s%-*.*s%s %s│%s' \
+      "$C_BOLD" "$C_CYAN" "${widths[i]}" "${widths[i]}" "${headers[i]}" \
+      "$C_RESET" "$C_CYAN" "$C_RESET"
+  done
+  echo
+  draw_table_border '├' '┼' '┤'
+
+  for row in "${rows[@]}"; do
+    if [[ -z "${row//|/}" ]]; then
+      draw_table_border '├' '┼' '┤'
+      continue
+    fi
+    IFS='|' read -r -a fields <<< "$row"
+    printf '%s│%s' "$C_CYAN" "$C_RESET"
+    for ((i = 0; i < ${#headers[@]}; i++)); do
+      value="${fields[i]:-}"
+      printf ' %-*.*s %s│%s' \
+        "${widths[i]}" "${widths[i]}" "$value" "$C_CYAN" "$C_RESET"
+    done
+    echo
+  done
+  draw_table_border '╰' '┴' '╯'
+}
+
+interactive_select() {
+  local mode="$1"
+  local header="$2"
+  local preselected="$3"
+  shift 3
+  local -a options=("$@") selected=()
+  local cursor=0 key sequence redraw=0 lines option marker prefix i
+
+  [[ -r /dev/tty ]] || {
+    message "$C_RED" "Interactive selection requires a terminal." >&2
+    return 1
+  }
+
+  for ((i = 0; i < ${#options[@]}; i++)); do
+    selected[i]=0
+    if [[ "$mode" == "multi" && ",$preselected," == *",${options[i]},"* ]]; then
+      selected[i]=1
+    fi
+  done
+  lines=$((${#options[@]} + 2))
+
+  while true; do
+    ((redraw == 1)) && printf '\033[%dA' "$lines" >&2
+    printf '\r\033[K%s%s%s\n' "$C_BOLD" "$header" "$C_RESET" >&2
+    printf '\r\033[K%s\n' \
+      "↑/↓: move · Space: toggle · Enter: confirm" >&2
+    for ((i = 0; i < ${#options[@]}; i++)); do
+      prefix='  '
+      ((i == cursor)) && prefix='> '
+      marker=''
+      if [[ "$mode" == "multi" ]]; then
+        marker='[ ] '
+        ((selected[i] == 1)) && marker='[x] '
+      fi
+      option="${options[i]}"
+      if ((i == cursor)); then
+        printf '\r\033[K%s%s%s%s%s\n' \
+          "$C_CYAN" "$prefix" "$marker" "$option" "$C_RESET" >&2
+      elif ((selected[i] == 1)); then
+        printf '\r\033[K%s%s%s%s%s\n' \
+          "$C_GREEN" "$prefix" "$marker" "$option" "$C_RESET" >&2
+      else
+        printf '\r\033[K%s%s%s\n' "$prefix" "$marker" "$option" >&2
+      fi
+    done
+    redraw=1
+
+    IFS= read -rsn1 key < /dev/tty || return 1
+    if [[ "$key" == $'\e' ]]; then
+      IFS= read -rsn2 -t 0.1 sequence < /dev/tty || sequence=""
+      case "$sequence" in
+        '[A') ((cursor > 0)) && cursor=$((cursor - 1)) ;;
+        '[B') ((cursor + 1 < ${#options[@]})) && cursor=$((cursor + 1)) ;;
+      esac
+    elif [[ "$key" == " " && "$mode" == "multi" ]]; then
+      selected[cursor]=$((1 - selected[cursor]))
+    elif [[ -z "$key" ]]; then
+      break
+    fi
+  done
+
+  if [[ "$mode" == "single" ]]; then
+    printf '%s\n' "${options[cursor]}"
+  else
+    for ((i = 0; i < ${#options[@]}; i++)); do
+      ((selected[i] == 1)) && printf '%s\n' "${options[i]}"
+    done
+  fi
+  return 0
+}
+
+for cmd in nmap awk ip mktemp sort timeout; do
   require_cmd "$cmd"
 done
 
@@ -49,7 +214,12 @@ DISCOVERED_HOSTS_FILE="$(mktemp)"
 PORT_SCAN_FILE="$(mktemp)"
 PORT_SCAN_STATUS_FILE="$(mktemp)"
 ALL_PORT_SCAN_FILE="$(mktemp)"
-trap 'rm -f "$TMP_FILE" "$SCAN_STATUS_FILE" "$ALL_NETWORK_SCAN_FILE" "$DISCOVERED_HOSTS_FILE" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE" "$ALL_PORT_SCAN_FILE"' EXIT
+cleanup() {
+  rm -f "$TMP_FILE" "$SCAN_STATUS_FILE" "$ALL_NETWORK_SCAN_FILE" \
+    "$DISCOVERED_HOSTS_FILE" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE" \
+    "$ALL_PORT_SCAN_FILE"
+}
+trap cleanup EXIT
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -80,15 +250,8 @@ is_valid_maxtime() {
 
 choose_maxtime() {
   local selected
-  selected="$(
-    printf '%s\n' \
-      "60 seconds" \
-      "120 seconds" \
-      "180 seconds" \
-      "240 seconds" \
-      "300 seconds" \
-    | gum choose --header "Select maximum scan time"
-  )"
+  selected="$(interactive_select single "Select maximum scan time" "" \
+    "60 seconds" "120 seconds" "180 seconds" "240 seconds" "300 seconds")"
   awk '{print $1}' <<< "$selected"
 }
 
@@ -98,8 +261,8 @@ parse_args() {
       --maxtime)
         if [[ $# -gt 1 && "$2" =~ ^[0-9]+$ ]]; then
           if ! is_valid_maxtime "$2"; then
-            gum style --foreground 196 --bold -- "Invalid max time: $2"
-            gum style --foreground 240 -- "Allowed values: 60, 120, 180, 240, 300"
+            message "$C_RED$C_BOLD" "Invalid max time: $2"
+            message "$C_GRAY" "Allowed values: 60, 120, 180, 240, 300"
             exit 1
           fi
           MAXTIME="$2"
@@ -118,7 +281,7 @@ parse_args() {
           NETWORK="$1"
           shift
         else
-          gum style --foreground 196 --bold -- "Unexpected argument: $1"
+          message "$C_RED$C_BOLD" "Unexpected argument: $1"
           usage
           exit 1
         fi
@@ -221,17 +384,10 @@ run_precheck_for_network() {
 
 # Print precheck rows supplied as pipe-separated values on stdin.
 print_precheck_table() {
-  gum style --foreground 213 --bold -- "Network Precheck"
-  gum table \
-    --print \
-    --separator '|' \
-    --columns "INTERFACE,NETWORK,LOCAL IP,ROUTE IF,ROUTE SRC,GATEWAY,STATUS,NOTE" \
-    --widths "12,18,16,12,16,16,12,52" \
-    --border rounded \
-    --border.foreground 213 \
-    --header.foreground 51 \
-    --cell.foreground 51 \
-    --selected.foreground 51
+  message "$C_MAGENTA$C_BOLD" "Network Precheck"
+  print_table \
+    "INTERFACE|NETWORK|LOCAL IP|ROUTE IF|ROUTE SRC|GATEWAY|STATUS|NOTE" \
+    "18|20|18|16|18|18|14|52"
 }
 
 # Run precheck on all active networks, print reports, store results.
@@ -251,7 +407,7 @@ run_all_prechecks() {
   done < <(get_networks)
 
   if [[ $found -eq 0 ]]; then
-    gum style --foreground 196 --bold -- "No active IPv4 networks found."
+    message "$C_RED$C_BOLD" "No active IPv4 networks found."
     exit 1
   fi
 
@@ -277,20 +433,9 @@ choose_network_from_precheck() {
 
   local selected ready_csv
   ready_csv="$(IFS=,; echo "${ready_options[*]}")"
-  selected="$(
-    printf '%s\n' "${options[@]}" \
-    | gum choose \
-        --no-limit \
-        --ordered \
-        --selected "$ready_csv" \
-        --header "Select networks — Space: toggle, Enter: scan" \
-        --cursor "> " \
-        --cursor-prefix "[ ] " \
-        --selected-prefix "[x] " \
-        --unselected-prefix "[ ] " \
-        --cursor.foreground 51 \
-        --selected.foreground 82
-  )"
+  selected="$(interactive_select multi \
+    "Select networks — Space: toggle · Enter: scan" \
+    "$ready_csv" "${options[@]}")"
 
   # Extract one CIDR per selected row (second field).
   awk '{print $2}' <<< "$selected"
@@ -314,16 +459,16 @@ handle_manual_network() {
 
   if [[ -n "$matched_cidr" ]]; then
     echo
-    gum style --foreground 213 --bold -- "Precheck for selected network:"
+    message "$C_MAGENTA$C_BOLD" "Precheck for selected network:"
     run_precheck_for_network "$matched_iface" "$matched_cidr"
     printf '%s\n' \
       "${PC_IFACE}|${PC_CIDR}|${PC_LOCAL_IP}|${PC_ROUTE_IF}|${PC_ROUTE_SRC}|${PC_GATEWAY}|${PC_STATUS}|${PC_NOTE:-—}" \
       | print_precheck_table
   else
     echo
-    gum style --foreground 214 --bold -- \
+    message "$C_YELLOW$C_BOLD" \
       "Warning: $target was not detected as a local network."
-    gum style --foreground 240 -- \
+    message "$C_GRAY" \
       "Proceeding with scan anyway — results may be limited."
   fi
 }
@@ -447,48 +592,28 @@ print_combined_network_scan_report() {
     "$ALL_NETWORK_SCAN_FILE")"
 
   echo
-  gum style --foreground 213 --bold -- "Network Scan Report"
-  gum style --foreground 51 -- \
+  message "$C_MAGENTA$C_BOLD" "Network Scan Report"
+  message "$C_CYAN" \
     "Networks scanned: $network_total · Hosts found: $host_total · Max time per network: ${MAXTIME}s"
   echo
-  gum table \
-    --print \
-    --separator '|' \
-    --columns "NETWORK,IP ADDRESS,MAC ADDRESS,VENDOR,STATUS" \
-    --widths "22,18,20,32,14" \
-    --border rounded \
-    --border.foreground 51 \
-    --header.foreground 51 \
-    --cell.foreground 252 \
+  print_table \
+    "NETWORK|IP ADDRESS|MAC ADDRESS|VENDOR|STATUS" \
+    "22|18|20|32|14" \
     < "$ALL_NETWORK_SCAN_FILE"
 }
 
 choose_hosts_for_port_scan() {
   local select_all_label="Select all discovered IPs"
   local options=("$select_all_label")
-  local network ip selected selected_line menu_height select_all=0
+  local network ip selected selected_line select_all=0
 
   while IFS='|' read -r network ip; do
     [[ -n "${network:-}" && -n "${ip:-}" ]] || continue
     options+=("$ip  [$network]")
   done < <(sort -t '|' -k2,2 -u "$DISCOVERED_HOSTS_FILE")
 
-  menu_height=${#options[@]}
-
-  selected="$(
-    printf '%s\n' "${options[@]}" \
-      | gum choose \
-        --no-limit \
-        --ordered \
-        --height "$menu_height" \
-        --header "Select IPs — Space: toggle · Enter: scan ports" \
-        --cursor "> " \
-        --cursor-prefix "[ ] " \
-        --selected-prefix "[x] " \
-        --unselected-prefix "[ ] " \
-        --cursor.foreground 51 \
-        --selected.foreground 82
-  )"
+  selected="$(interactive_select multi \
+    "Select IPs — Space: toggle · Enter: scan ports" "" "${options[@]}")"
 
   while IFS= read -r selected_line; do
     if [[ "$selected_line" == "$select_all_label" ]]; then
@@ -502,6 +627,7 @@ choose_hosts_for_port_scan() {
   elif [[ -n "$selected" ]]; then
     printf '%s\n' "$selected"
   fi
+  return 0
 }
 
 run_port_scan() {
@@ -532,23 +658,50 @@ run_port_scan() {
   fi
 }
 
+run_port_scan_with_countdown() {
+  local ip="$1"
+  local maxtime="$2"
+  local output_file="$3"
+  local status_file="$4"
+  local scan_number="$5"
+  local scan_total="$6"
+  local scan_pid start_time elapsed remaining open_ports
+
+  bash -c "$(declare -f run_port_scan); \
+    run_port_scan \"\$1\" \"\$2\" \"\$3\" \"\$4\"" \
+    _ "$ip" "$maxtime" "$output_file" "$status_file" &
+  scan_pid=$!
+  start_time=$SECONDS
+
+  while kill -0 "$scan_pid" 2>/dev/null; do
+    elapsed=$((SECONDS - start_time))
+    remaining=$((maxtime - elapsed))
+    ((remaining < 0)) && remaining=0
+    open_ports=0
+    if [[ -s "$output_file" ]]; then
+      open_ports="$(wc -l < "$output_file" | tr -d ' ')"
+    fi
+    printf '\r\033[KScanning ports on %s (%d/%d) — open: %d — stopping in %ds' \
+      "$ip" "$scan_number" "$scan_total" "$open_ports" "$remaining"
+    sleep 1
+  done
+
+  wait "$scan_pid" || true
+  printf '\r\033[KPort scan finished for %s (%d/%d).\n' \
+    "$ip" "$scan_number" "$scan_total"
+}
+
 print_combined_port_scan_report() {
   local host_total="$1"
 
   echo
-  gum style --foreground 213 --bold -- "Port Scan Report"
-  gum style --foreground 51 -- \
+  message "$C_MAGENTA$C_BOLD" "Port Scan Report"
+  message "$C_CYAN" \
     "Hosts scanned: $host_total · TCP ports: 1,000 most common · Max time per host: ${MAXTIME}s"
   echo
-  gum table \
-    --print \
-    --separator '|' \
-    --columns "HOST,PORT,PROTOCOL,STATE,SERVICE" \
-    --widths "18,10,12,18,28" \
-    --border rounded \
-    --border.foreground 51 \
-    --header.foreground 51 \
-    --cell.foreground 252 \
+  print_table \
+    "HOST|PORT|PROTOCOL|STATE|SERVICE" \
+    "18|10|12|18|28" \
     < "$ALL_PORT_SCAN_FILE"
 }
 
@@ -582,7 +735,7 @@ else
 fi
 
 if [[ ${#NETWORKS[@]} -eq 0 ]]; then
-  gum style --foreground 196 --bold -- "No networks selected."
+  message "$C_RED$C_BOLD" "No networks selected."
   exit 1
 fi
 
@@ -622,11 +775,9 @@ if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
     for SELECTED_HOST in "${SELECTED_HOSTS[@]}"; do
       PORT_SCAN_NUMBER=$((PORT_SCAN_NUMBER + 1))
       SELECTED_IP="$(awk '{print $1}' <<< "$SELECTED_HOST")"
-      gum spin --spinner dot \
-        --title "Scanning TCP ports on $SELECTED_IP ($PORT_SCAN_NUMBER/$PORT_SCAN_TOTAL) ..." -- \
-        bash -c "$(declare -f run_port_scan); \
-          run_port_scan \"\$1\" \"\$2\" \"\$3\" \"\$4\"" \
-      _ "$SELECTED_IP" "$MAXTIME" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE"
+      run_port_scan_with_countdown \
+        "$SELECTED_IP" "$MAXTIME" "$PORT_SCAN_FILE" \
+        "$PORT_SCAN_STATUS_FILE" "$PORT_SCAN_NUMBER" "$PORT_SCAN_TOTAL"
 
       PORT_SCAN_RESULT="$(cat "$PORT_SCAN_STATUS_FILE")"
       if [[ -s "$ALL_PORT_SCAN_FILE" ]]; then
@@ -659,8 +810,8 @@ if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
 
     print_combined_port_scan_report "$PORT_SCAN_TOTAL"
   else
-    gum style --foreground 240 -- "Port scan skipped."
+    message "$C_GRAY" "Port scan skipped."
   fi
 else
-  gum style --foreground 214 -- "No hosts were found; port scan selection skipped."
+  message "$C_YELLOW" "No hosts were found; port scan selection skipped."
 fi
