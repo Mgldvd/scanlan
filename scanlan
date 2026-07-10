@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# scanlan
+# Usage:
+#   ./scanlan
+#   ./scanlan 10.10.10.0/24
+#   ./scanlan --maxtime
+#   ./scanlan --maxtime 180
+#   ./scanlan --maxtime 180 10.10.10.0/24
+
+DEFAULT_MAXTIME=120
+MAXTIME="$DEFAULT_MAXTIME"
+NETWORK=""
+
+HAS_ARPING=0
+command -v arping >/dev/null 2>&1 && HAS_ARPING=1
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Error: missing command '$1'" >&2
+    exit 1
+  }
+}
+
+for cmd in nmap gum awk ip mktemp sort timeout; do
+  require_cmd "$cmd"
+done
+
+TMP_FILE="$(mktemp)"
+SCAN_STATUS_FILE="$(mktemp)"
+DISCOVERED_HOSTS_FILE="$(mktemp)"
+PORT_SCAN_FILE="$(mktemp)"
+PORT_SCAN_STATUS_FILE="$(mktemp)"
+ALL_PORT_SCAN_FILE="$(mktemp)"
+trap 'rm -f "$TMP_FILE" "$SCAN_STATUS_FILE" "$DISCOVERED_HOSTS_FILE" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE" "$ALL_PORT_SCAN_FILE"' EXIT
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scanlan
+  ./scanlan 10.10.10.0/24
+  ./scanlan --maxtime
+  ./scanlan --maxtime 180
+  ./scanlan --maxtime 180 10.10.10.0/24
+
+Options:
+  --maxtime           Open a chooser for max scan time
+  --maxtime <sec>     Set max scan time directly (60, 120, 180, 240, 300)
+  -h, --help          Show this help
+EOF
+}
+
+is_valid_maxtime() {
+  case "${1:-}" in
+    60|120|180|240|300) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+choose_maxtime() {
+  local selected
+  selected="$(
+    printf '%s\n' \
+      "60 seconds" \
+      "120 seconds" \
+      "180 seconds" \
+      "240 seconds" \
+      "300 seconds" \
+    | gum choose --header "Select maximum scan time"
+  )"
+  awk '{print $1}' <<< "$selected"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --maxtime)
+        if [[ $# -gt 1 && "$2" =~ ^[0-9]+$ ]]; then
+          if ! is_valid_maxtime "$2"; then
+            gum style --foreground 196 --bold -- "Invalid max time: $2"
+            gum style --foreground 240 -- "Allowed values: 60, 120, 180, 240, 300"
+            exit 1
+          fi
+          MAXTIME="$2"
+          shift 2
+        else
+          MAXTIME="$(choose_maxtime)"
+          shift
+        fi
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        if [[ -z "$NETWORK" ]]; then
+          NETWORK="$1"
+          shift
+        else
+          gum style --foreground 196 --bold -- "Unexpected argument: $1"
+          usage
+          exit 1
+        fi
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Network discovery
+# ---------------------------------------------------------------------------
+
+get_networks() {
+  ip -o -4 addr show up scope global | awk '
+    {
+      iface=$2
+      cidr=$4
+      print iface "|" cidr
+    }
+  ' | sort -u
+}
+
+# Derive the .1 probe IP from a CIDR (e.g. 192.168.1.5/24 → 192.168.1.1)
+cidr_probe_ip() {
+  local cidr="$1"
+  local ip="${cidr%/*}"
+  # Replace last octet with 1
+  printf '%s.1\n' "${ip%.*}"
+}
+
+# Extract local IP from CIDR (strip prefix)
+cidr_local_ip() {
+  printf '%s\n' "${1%/*}"
+}
+
+# ---------------------------------------------------------------------------
+# Precheck
+# ---------------------------------------------------------------------------
+
+# Runs precheck for one network and stores result fields in globals:
+#   PC_IFACE, PC_CIDR, PC_LOCAL_IP, PC_ROUTE_IF, PC_ROUTE_SRC,
+#   PC_GATEWAY, PC_STATUS, PC_NOTE
+run_precheck_for_network() {
+  local iface="$1"
+  local cidr="$2"
+
+  PC_IFACE="$iface"
+  PC_CIDR="$cidr"
+  PC_LOCAL_IP="$(cidr_local_ip "$cidr")"
+  PC_ROUTE_IF="N/A"
+  PC_ROUTE_SRC="N/A"
+  PC_GATEWAY="N/A"
+  PC_STATUS="UNREACHABLE"
+  PC_NOTE=""
+
+  local probe_ip
+  probe_ip="$(cidr_probe_ip "$cidr")"
+
+  # Get routing info
+  local route_out
+  route_out="$(ip route get "$probe_ip" 2>/dev/null || true)"
+
+  if [[ -z "$route_out" ]]; then
+    PC_NOTE="No route to probe IP $probe_ip"
+    return
+  fi
+
+  PC_ROUTE_IF="$(awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' <<< "$route_out" | head -1)"
+  PC_ROUTE_SRC="$(awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' <<< "$route_out" | head -1)"
+
+  # Try to find gateway from route table for this iface
+  PC_GATEWAY="$(ip route show dev "$iface" 2>/dev/null \
+    | awk '/default/{print $3; exit}')"
+  [[ -z "$PC_GATEWAY" ]] && \
+    PC_GATEWAY="$(ip route show 2>/dev/null \
+      | awk -v iface="$iface" '/default/ && $0~iface {print $3; exit}')"
+  [[ -z "$PC_GATEWAY" ]] && PC_GATEWAY="N/A"
+
+  # Validate route points to the right interface
+  if [[ -z "$PC_ROUTE_IF" || "$PC_ROUTE_IF" != "$iface" ]]; then
+    PC_STATUS="LIMITED"
+    PC_NOTE="Route goes through ${PC_ROUTE_IF:-unknown}, not $iface"
+    return
+  fi
+
+  # Try ARP probe if arping available
+  if [[ "$HAS_ARPING" -eq 1 ]]; then
+    if sudo arping -c 1 -w 1 -I "$iface" "$probe_ip" >/dev/null 2>&1; then
+      PC_STATUS="READY"
+      PC_NOTE="ARP response from $probe_ip"
+    else
+      PC_STATUS="LIMITED"
+      PC_NOTE="No ARP response from $probe_ip (may still be scannable)"
+    fi
+  else
+    PC_STATUS="LIMITED"
+    PC_NOTE="arping not available — ARP probe skipped"
+  fi
+}
+
+# Print precheck rows supplied as pipe-separated values on stdin.
+print_precheck_table() {
+  gum style --foreground 213 --bold -- "Network Precheck"
+  gum table \
+    --print \
+    --separator '|' \
+    --columns "INTERFACE,NETWORK,LOCAL IP,ROUTE IF,ROUTE SRC,GATEWAY,STATUS,NOTE" \
+    --widths "12,18,16,12,16,16,12,52" \
+    --border rounded \
+    --border.foreground 213 \
+    --header.foreground 51 \
+    --cell.foreground 51 \
+    --selected.foreground 51
+}
+
+# Run precheck on all active networks, print reports, store results.
+# Populates:
+#   PRECHECK_ENTRIES  — array of "iface|cidr|status" strings
+run_all_prechecks() {
+  PRECHECK_ENTRIES=()
+  local table_rows=()
+
+  local found=0
+  while IFS='|' read -r iface cidr; do
+    [[ -n "${iface:-}" && -n "${cidr:-}" ]] || continue
+    found=1
+    run_precheck_for_network "$iface" "$cidr"
+    PRECHECK_ENTRIES+=("${iface}|${cidr}|${PC_STATUS}")
+    table_rows+=("${PC_IFACE}|${PC_CIDR}|${PC_LOCAL_IP}|${PC_ROUTE_IF}|${PC_ROUTE_SRC}|${PC_GATEWAY}|${PC_STATUS}|${PC_NOTE:-—}")
+  done < <(get_networks)
+
+  if [[ $found -eq 0 ]]; then
+    gum style --foreground 196 --bold -- "No active IPv4 networks found."
+    exit 1
+  fi
+
+  printf '%s\n' "${table_rows[@]}" | print_precheck_table
+}
+
+# ---------------------------------------------------------------------------
+# Network selection
+# ---------------------------------------------------------------------------
+
+choose_network_from_precheck() {
+  local options=()
+  local ready_options=()
+
+  for entry in "${PRECHECK_ENTRIES[@]}"; do
+    IFS='|' read -r iface cidr status <<< "$entry"
+    local option="${iface}  ${cidr}  [${status}]"
+    options+=("$option")
+    if [[ "$status" == "READY" ]]; then
+      ready_options+=("$option")
+    fi
+  done
+
+  local selected ready_csv
+  ready_csv="$(IFS=,; echo "${ready_options[*]}")"
+  selected="$(
+    printf '%s\n' "${options[@]}" \
+    | gum choose \
+        --no-limit \
+        --ordered \
+        --selected "$ready_csv" \
+        --header "Select networks — Space: toggle, Enter: scan" \
+        --cursor "> " \
+        --cursor-prefix "[ ] " \
+        --selected-prefix "[x] " \
+        --unselected-prefix "[ ] " \
+        --cursor.foreground 51 \
+        --selected.foreground 82
+  )"
+
+  # Extract one CIDR per selected row (second field).
+  awk '{print $2}' <<< "$selected"
+}
+
+# If user passed a network manually, find it in precheck entries and show
+# its report, or warn if not found.
+handle_manual_network() {
+  local target="$1"
+  local matched_iface="" matched_cidr="" matched_status=""
+
+  for entry in "${PRECHECK_ENTRIES[@]}"; do
+    IFS='|' read -r iface cidr status <<< "$entry"
+    if [[ "$cidr" == "$target" ]]; then
+      matched_iface="$iface"
+      matched_cidr="$cidr"
+      matched_status="$status"
+      break
+    fi
+  done
+
+  if [[ -n "$matched_cidr" ]]; then
+    echo
+    gum style --foreground 213 --bold -- "Precheck for selected network:"
+    run_precheck_for_network "$matched_iface" "$matched_cidr"
+    printf '%s\n' \
+      "${PC_IFACE}|${PC_CIDR}|${PC_LOCAL_IP}|${PC_ROUTE_IF}|${PC_ROUTE_SRC}|${PC_GATEWAY}|${PC_STATUS}|${PC_NOTE:-—}" \
+      | print_precheck_table
+  else
+    echo
+    gum style --foreground 214 --bold -- \
+      "Warning: $target was not detected as a local network."
+    gum style --foreground 240 -- \
+      "Proceeding with scan anyway — results may be limited."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Scanning
+# ---------------------------------------------------------------------------
+
+scan_network() {
+  local network="$1"
+
+  sudo nmap -sn -n -T4 --max-retries 1 --host-timeout 8s "$network" 2>/dev/null | awk '
+    function emit_host() {
+      if (ip != "") {
+        printf "%-15s %-20s %-30s\n", ip, mac, vendor
+        fflush()
+      }
+    }
+    /Nmap scan report for / {
+      emit_host()
+      ip=$NF
+      mac="N/A"
+      vendor="N/A"
+    }
+    /MAC Address: / {
+      mac=$3
+      vendor=$0
+      sub(/^.*MAC Address: [^ ]+ \(/, "", vendor)
+      sub(/\)$/, "", vendor)
+    }
+    END {
+      emit_host()
+    }
+  '
+}
+
+run_scan_with_timeout() {
+  local network="$1"
+  local maxtime="$2"
+  local tmp_file="$3"
+  local status_file="$4"
+
+  if timeout "${maxtime}s" bash -c \
+      "$(declare -f scan_network); scan_network \"\$1\" > \"\$2\"" \
+      _ "$network" "$tmp_file"; then
+    echo "ok" > "$status_file"
+  else
+    local status=$?
+    if [[ $status -eq 124 ]]; then
+      echo "timeout" > "$status_file"
+    else
+      echo "error:$status" > "$status_file"
+    fi
+  fi
+}
+
+run_scan_with_countdown() {
+  local network="$1"
+  local maxtime="$2"
+  local tmp_file="$3"
+  local status_file="$4"
+  local scan_number="$5"
+  local scan_total="$6"
+  local scan_pid start_time elapsed remaining live_hosts
+
+  bash -c "$(declare -f scan_network); $(declare -f run_scan_with_timeout); \
+    run_scan_with_timeout \"\$1\" \"\$2\" \"\$3\" \"\$4\"" \
+    _ "$network" "$maxtime" "$tmp_file" "$status_file" &
+  scan_pid=$!
+  start_time=$SECONDS
+
+  while kill -0 "$scan_pid" 2>/dev/null; do
+    elapsed=$((SECONDS - start_time))
+    remaining=$((maxtime - elapsed))
+    ((remaining < 0)) && remaining=0
+    live_hosts=0
+    if [[ -s "$tmp_file" ]]; then
+      live_hosts="$(wc -l < "$tmp_file" | tr -d ' ')"
+    fi
+    printf '\r\033[KScanning %s (%d/%d) — hosts found: %d — stopping in %ds' \
+      "$network" "$scan_number" "$scan_total" "$live_hosts" "$remaining"
+    sleep 1
+  done
+
+  wait "$scan_pid" || true
+  printf '\r\033[KScan finished for %s (%d/%d).\n' \
+    "$network" "$scan_number" "$scan_total"
+}
+
+print_scan_report() {
+  local network="$1"
+  local scan_result="$2"
+  local tmp_file="$3"
+  local host_count=0
+
+  if [[ -s "$tmp_file" ]]; then
+    host_count="$(wc -l < "$tmp_file" | tr -d ' ')"
+  fi
+
+  {
+    gum style --foreground 213 --bold -- "Network Scan Report"
+    echo
+    gum style --foreground 51 --bold -- "Network: $network"
+    gum style --foreground 213 --bold -- "Max scan time: ${MAXTIME}s"
+    gum style --foreground 213 --bold -- "Hosts found: $host_count"
+    echo
+
+    case "$scan_result" in
+      ok)
+        gum style --foreground 82 --bold -- "Scan completed successfully."
+        ;;
+      timeout)
+        gum style --foreground 214 --bold -- "Scan stopped after ${MAXTIME}s timeout."
+        gum style --foreground 240 -- "Partial results are shown below, if any were found."
+        ;;
+      error:*)
+        gum style --foreground 196 --bold -- "Scan ended with an error (${scan_result#error:})."
+        gum style --foreground 240 -- "Partial results are shown below, if any were found."
+        ;;
+    esac
+    echo
+
+    if [[ -s "$tmp_file" ]]; then
+      while read -r ip mac vendor; do
+        printf '%s|%s|%s\n' "$ip" "$mac" "$vendor"
+      done < "$tmp_file" \
+        | gum table \
+            --print \
+            --separator '|' \
+            --columns "IP ADDRESS,MAC ADDRESS,VENDOR" \
+            --widths "18,20,42" \
+            --border rounded \
+            --border.foreground 39 \
+            --header.foreground 226 \
+            --cell.foreground 252
+    else
+      gum style --foreground 214 -- "No hosts were found on this network."
+      gum style --foreground 240 -- "Try another network, increase max time, or verify connectivity."
+    fi
+  } | gum style \
+        --border rounded \
+        --border-foreground 51 \
+        --padding "1 2" \
+        --margin "1 0"
+}
+
+choose_hosts_for_port_scan() {
+  local options=()
+  local network ip
+
+  while IFS='|' read -r network ip; do
+    [[ -n "${network:-}" && -n "${ip:-}" ]] || continue
+    options+=("$ip  [$network]")
+  done < <(sort -t '|' -k2,2 -u "$DISCOVERED_HOSTS_FILE")
+
+  printf '%s\n' "${options[@]}" \
+    | gum choose \
+        --no-limit \
+        --ordered \
+        --header "Select IPs — Space: toggle, Enter: scan ports" \
+        --cursor "> " \
+        --cursor-prefix "[ ] " \
+        --selected-prefix "[x] " \
+        --unselected-prefix "[ ] " \
+        --cursor.foreground 51 \
+        --selected.foreground 82
+}
+
+run_port_scan() {
+  local ip="$1"
+  local maxtime="$2"
+  local output_file="$3"
+  local status_file="$4"
+
+  set -o pipefail
+
+  if timeout "${maxtime}s" sudo nmap \
+      -sS -n -T4 --max-retries 1 --host-timeout 30s "$ip" 2>/dev/null \
+      | awk '
+          /^[0-9]+\/tcp[[:space:]]/ && $2 == "open" {
+            split($1, port_info, "/")
+            printf "%s|%s|%s|%s\n", port_info[1], port_info[2], $2, $3
+            fflush()
+          }
+        ' > "$output_file"; then
+    echo "ok" > "$status_file"
+  else
+    local status=$?
+    if [[ $status -eq 124 ]]; then
+      echo "timeout" > "$status_file"
+    else
+      echo "error:$status" > "$status_file"
+    fi
+  fi
+}
+
+print_combined_port_scan_report() {
+  local host_total="$1"
+
+  echo
+  gum style --foreground 213 --bold -- "Port Scan Report"
+  gum style --foreground 51 -- \
+    "Hosts scanned: $host_total · TCP ports: 1,000 most common · Max time per host: ${MAXTIME}s"
+  echo
+  gum table \
+    --print \
+    --separator '|' \
+    --columns "HOST,PORT,PROTOCOL,STATE,SERVICE" \
+    --widths "18,10,12,18,28" \
+    --border rounded \
+    --border.foreground 51 \
+    --header.foreground 51 \
+    --cell.foreground 252 \
+    < "$ALL_PORT_SCAN_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+parse_args "$@"
+
+# --- Precheck phase ---------------------------------------------------------
+
+gum style --foreground 213 --bold -- "Running network precheck..."
+echo
+
+declare -a PRECHECK_ENTRIES
+run_all_prechecks
+
+echo
+
+# --- Network selection ------------------------------------------------------
+
+declare -a NETWORKS
+if [[ -z "$NETWORK" ]]; then
+  mapfile -t NETWORKS < <(choose_network_from_precheck)
+else
+  handle_manual_network "$NETWORK"
+  NETWORKS=("$NETWORK")
+fi
+
+if [[ ${#NETWORKS[@]} -eq 0 ]]; then
+  gum style --foreground 196 --bold -- "No networks selected."
+  exit 1
+fi
+
+echo
+
+# --- Scan phase -------------------------------------------------------------
+
+sudo -v
+
+SCAN_TOTAL=${#NETWORKS[@]}
+SCAN_NUMBER=0
+for network in "${NETWORKS[@]}"; do
+  SCAN_NUMBER=$((SCAN_NUMBER + 1))
+  run_scan_with_countdown \
+    "$network" "$MAXTIME" "$TMP_FILE" "$SCAN_STATUS_FILE" \
+    "$SCAN_NUMBER" "$SCAN_TOTAL"
+
+  SCAN_RESULT="$(cat "$SCAN_STATUS_FILE")"
+  print_scan_report "$network" "$SCAN_RESULT" "$TMP_FILE"
+  awk -v network="$network" '{print network "|" $1}' "$TMP_FILE" \
+    >> "$DISCOVERED_HOSTS_FILE"
+done
+
+# --- Optional port scan phase ----------------------------------------------
+
+if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
+  echo
+  declare -a SELECTED_HOSTS
+  mapfile -t SELECTED_HOSTS < <(choose_hosts_for_port_scan)
+
+  if [[ ${#SELECTED_HOSTS[@]} -gt 0 ]]; then
+    PORT_SCAN_TOTAL=${#SELECTED_HOSTS[@]}
+    PORT_SCAN_NUMBER=0
+    for SELECTED_HOST in "${SELECTED_HOSTS[@]}"; do
+      PORT_SCAN_NUMBER=$((PORT_SCAN_NUMBER + 1))
+      SELECTED_IP="$(awk '{print $1}' <<< "$SELECTED_HOST")"
+      gum spin --spinner dot \
+        --title "Scanning TCP ports on $SELECTED_IP ($PORT_SCAN_NUMBER/$PORT_SCAN_TOTAL) ..." -- \
+        bash -c "$(declare -f run_port_scan); \
+          run_port_scan \"\$1\" \"\$2\" \"\$3\" \"\$4\"" \
+      _ "$SELECTED_IP" "$MAXTIME" "$PORT_SCAN_FILE" "$PORT_SCAN_STATUS_FILE"
+
+      PORT_SCAN_RESULT="$(cat "$PORT_SCAN_STATUS_FILE")"
+      if [[ -s "$ALL_PORT_SCAN_FILE" ]]; then
+        printf '%s\n' '||||' >> "$ALL_PORT_SCAN_FILE"
+      fi
+
+      if [[ -s "$PORT_SCAN_FILE" ]]; then
+        awk -v ip="$SELECTED_IP" '{print ip "|" $0}' "$PORT_SCAN_FILE" \
+          >> "$ALL_PORT_SCAN_FILE"
+      fi
+
+      case "$PORT_SCAN_RESULT" in
+        ok)
+          if [[ ! -s "$PORT_SCAN_FILE" ]]; then
+            printf '%s|-|-|NO OPEN PORTS|-\n' "$SELECTED_IP" \
+              >> "$ALL_PORT_SCAN_FILE"
+          fi
+          ;;
+        timeout)
+          printf '%s|-|-|TIMEOUT|-\n' "$SELECTED_IP" \
+            >> "$ALL_PORT_SCAN_FILE"
+          ;;
+        error:*)
+          printf '%s|-|-|ERROR %s|-\n' \
+            "$SELECTED_IP" "${PORT_SCAN_RESULT#error:}" \
+            >> "$ALL_PORT_SCAN_FILE"
+          ;;
+      esac
+    done
+
+    print_combined_port_scan_report "$PORT_SCAN_TOTAL"
+  else
+    gum style --foreground 240 -- "Port scan skipped."
+  fi
+else
+  gum style --foreground 214 -- "No hosts were found; port scan selection skipped."
+fi
