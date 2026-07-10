@@ -2,6 +2,8 @@
 
 `scanlan` is an interactive Linux network scanner. It discovers active hosts on one or more local IPv4 networks and can scan the common TCP ports of selected hosts.
 
+![animacion](.img/animacion.gif)
+
 ## Requirements
 
 - Linux
@@ -16,7 +18,6 @@
 - `curl` (installation only)
 
 ## Install
-
 
 ```bash
 mkdir -p "$HOME/.local/bin"
@@ -33,13 +34,19 @@ scanlan --help
 scanlan
 ```
 
-2. Mark or unmark networks with Space.
+![Step 1](.img/1cphtwFaw7vUYDkgwY8G1.png)
 
-3. Start scanning the selected networks with Enter.
+- Mark or unmark networks with Space.
 
-4. Mark individual IP addresses or select `Select all discovered IPs`.
+![Step 2](.img/2j389v0Dcrdmi3HGSc8pb.png)
 
-5. Start the optional TCP port scans with Enter.
+- Start scanning the selected networks with Enter.
+
+- Mark individual IP addresses or select `Select all discovered IPs`.
+
+![Step 3](.img/3TQpI7JHzYaNoqjc48cpw.png)
+
+- Start the optional TCP port scans with Enter.
 
 ## How it works
 
