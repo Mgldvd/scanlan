@@ -42,7 +42,7 @@ scanlan
 
 - Start scanning the selected networks with Enter.
 
-- Mark individual IP addresses or select `Select all discovered IPs`.
+- Keep `Skip` selected to omit the port scan, or mark individual IP addresses or `Select all discovered IPs`.
 
 ![Step 3](.img/3TQpI7JHzYaNoqjc48cpw.png)
 
@@ -58,7 +58,7 @@ scanlan
 6. Discovers active hosts with `nmap -sn`.
 7. Shows live host counts and timeout countdowns.
 8. Displays IP, MAC address, and vendor results.
-9. Lets you select multiple discovered IP addresses.
+9. Preselects `Skip` and lets you select multiple discovered IP addresses instead.
 10. Scans the 1,000 most common TCP ports on each selected IP.
 11. Displays all open ports in one table.
 

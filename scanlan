@@ -203,6 +203,10 @@ interactive_select() {
   shift 3
   local -a options=("$@") selected=()
   local cursor=0 key sequence redraw=0 lines option marker prefix i
+  local is_multi=0 exclusive_first=0
+
+  [[ "$mode" != "single" ]] && is_multi=1
+  [[ "$mode" == "multi_exclusive_first" ]] && exclusive_first=1
 
   [[ -r /dev/tty ]] || {
     message "$C_RED" "Interactive selection requires a terminal." >&2
@@ -211,7 +215,7 @@ interactive_select() {
 
   for ((i = 0; i < ${#options[@]}; i++)); do
     selected[i]=0
-    if [[ "$mode" == "multi" && ",$preselected," == *",${options[i]},"* ]]; then
+    if [[ $is_multi -eq 1 && ",$preselected," == *",${options[i]},"* ]]; then
       selected[i]=1
     fi
   done
@@ -227,7 +231,7 @@ interactive_select() {
       prefix='  '
       ((i == cursor)) && prefix='> '
       marker=''
-      if [[ "$mode" == "multi" ]]; then
+      if [[ $is_multi -eq 1 ]]; then
         marker='[ ] '
         ((selected[i] == 1)) && marker='[x] '
       fi
@@ -251,8 +255,18 @@ interactive_select() {
         '[A') ((cursor > 0)) && cursor=$((cursor - 1)) ;;
         '[B') ((cursor + 1 < ${#options[@]})) && cursor=$((cursor + 1)) ;;
       esac
-    elif [[ "$key" == " " && "$mode" == "multi" ]]; then
-      selected[cursor]=$((1 - selected[cursor]))
+    elif [[ "$key" == " " && $is_multi -eq 1 ]]; then
+      if [[ $exclusive_first -eq 1 && $cursor -eq 0 ]]; then
+        for ((i = 0; i < ${#options[@]}; i++)); do
+          selected[i]=0
+        done
+        selected[0]=1
+      else
+        selected[cursor]=$((1 - selected[cursor]))
+        if [[ $exclusive_first -eq 1 && ${selected[cursor]} -eq 1 ]]; then
+          selected[0]=0
+        fi
+      fi
     elif [[ -z "$key" ]]; then
       break
     fi
@@ -665,27 +679,28 @@ print_combined_network_scan_report() {
 }
 
 choose_hosts_for_port_scan() {
+  local skip_label="Skip"
   local select_all_label="Select all discovered IPs"
-  local options=("$select_all_label")
-  local network ip selected selected_line select_all=0
+  local options=("$skip_label" "$select_all_label")
+  local network ip selected selected_line skip=0 select_all=0
 
   while IFS='|' read -r network ip; do
     [[ -n "${network:-}" && -n "${ip:-}" ]] || continue
     options+=("$ip  [$network]")
   done < <(sort -t '|' -k2,2 -u "$DISCOVERED_HOSTS_FILE")
 
-  selected="$(interactive_select multi \
-    "Select IPs — Space: toggle · Enter: scan ports" "" "${options[@]}")"
+  selected="$(interactive_select multi_exclusive_first \
+    "Select IPs — Space: toggle · Enter: continue" "$skip_label" "${options[@]}")"
 
   while IFS= read -r selected_line; do
-    if [[ "$selected_line" == "$select_all_label" ]]; then
-      select_all=1
-      break
-    fi
+    [[ "$selected_line" == "$skip_label" ]] && skip=1
+    [[ "$selected_line" == "$select_all_label" ]] && select_all=1
   done <<< "$selected"
 
-  if [[ $select_all -eq 1 ]]; then
-    printf '%s\n' "${options[@]:1}"
+  if [[ $skip -eq 1 ]]; then
+    return 0
+  elif [[ $select_all -eq 1 ]]; then
+    printf '%s\n' "${options[@]:2}"
   elif [[ -n "$selected" ]]; then
     printf '%s\n' "$selected"
   fi
