@@ -707,16 +707,40 @@ choose_hosts_for_port_scan() {
   return 0
 }
 
+choose_port_scan_scope() {
+  local selected
+  selected="$(interactive_select single "Select TCP port range" "" \
+    "Most common ports (top 100)" \
+    "1,000 most common ports" \
+    "All ports (1-65535)")"
+
+  case "$selected" in
+    "Most common ports (top 100)") printf '%s\n' "top100" ;;
+    "1,000 most common ports") printf '%s\n' "top1000" ;;
+    "All ports (1-65535)") printf '%s\n' "all" ;;
+  esac
+}
+
 run_port_scan() {
   local ip="$1"
   local maxtime="$2"
   local output_file="$3"
   local status_file="$4"
+  local scope="$5"
+  local -a port_args
+
+  case "$scope" in
+    top100) port_args=(--top-ports 100) ;;
+    top1000) port_args=(--top-ports 1000) ;;
+    all) port_args=(-p-) ;;
+    *) echo "error:invalid-scope" > "$status_file"; return ;;
+  esac
 
   set -o pipefail
 
   if timeout "${maxtime}s" sudo nmap \
-      -sS -n -T4 --max-retries 1 --host-timeout 30s "$ip" 2>/dev/null \
+      -sS -n -T4 --max-retries 1 --host-timeout "${maxtime}s" \
+      "${port_args[@]}" "$ip" 2>/dev/null \
       | awk '
           /^[0-9]+\/tcp[[:space:]]/ && $2 == "open" {
             split($1, port_info, "/")
@@ -742,11 +766,12 @@ run_port_scan_with_countdown() {
   local status_file="$4"
   local scan_number="$5"
   local scan_total="$6"
+  local scope="$7"
   local scan_pid start_time elapsed remaining open_ports
 
   bash -c "$(declare -f run_port_scan); \
-    run_port_scan \"\$1\" \"\$2\" \"\$3\" \"\$4\"" \
-    _ "$ip" "$maxtime" "$output_file" "$status_file" &
+    run_port_scan \"\$1\" \"\$2\" \"\$3\" \"\$4\" \"\$5\"" \
+    _ "$ip" "$maxtime" "$output_file" "$status_file" "$scope" &
   scan_pid=$!
   start_time=$SECONDS
 
@@ -770,11 +795,12 @@ run_port_scan_with_countdown() {
 
 print_combined_port_scan_report() {
   local host_total="$1"
+  local scope_label="$2"
 
   echo
   print_section_title "≡" "Port Scan Report"
   message "$C_CYAN" \
-    "Hosts scanned: $host_total · TCP ports: 1,000 most common · Max time per host: ${MAXTIME}s"
+    "Hosts scanned: $host_total · TCP ports: $scope_label · Max time per host: ${MAXTIME}s"
   echo
   print_table \
     "HOST|PORT|PROTOCOL|STATE|SERVICE" \
@@ -849,6 +875,13 @@ if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
   mapfile -t SELECTED_HOSTS < <(choose_hosts_for_port_scan)
 
   if [[ ${#SELECTED_HOSTS[@]} -gt 0 ]]; then
+    PORT_SCAN_SCOPE="$(choose_port_scan_scope)"
+    case "$PORT_SCAN_SCOPE" in
+      top100) PORT_SCAN_SCOPE_LABEL="100 most common" ;;
+      top1000) PORT_SCAN_SCOPE_LABEL="1,000 most common" ;;
+      all) PORT_SCAN_SCOPE_LABEL="all 65,535" ;;
+    esac
+
     PORT_SCAN_TOTAL=${#SELECTED_HOSTS[@]}
     PORT_SCAN_NUMBER=0
     for SELECTED_HOST in "${SELECTED_HOSTS[@]}"; do
@@ -856,7 +889,8 @@ if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
       SELECTED_IP="$(awk '{print $1}' <<< "$SELECTED_HOST")"
       run_port_scan_with_countdown \
         "$SELECTED_IP" "$MAXTIME" "$PORT_SCAN_FILE" \
-        "$PORT_SCAN_STATUS_FILE" "$PORT_SCAN_NUMBER" "$PORT_SCAN_TOTAL"
+        "$PORT_SCAN_STATUS_FILE" "$PORT_SCAN_NUMBER" "$PORT_SCAN_TOTAL" \
+        "$PORT_SCAN_SCOPE"
 
       PORT_SCAN_RESULT="$(cat "$PORT_SCAN_STATUS_FILE")"
       if [[ -s "$ALL_PORT_SCAN_FILE" ]]; then
@@ -887,7 +921,7 @@ if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
       esac
     done
 
-    print_combined_port_scan_report "$PORT_SCAN_TOTAL"
+    print_combined_port_scan_report "$PORT_SCAN_TOTAL" "$PORT_SCAN_SCOPE_LABEL"
   else
     message "$C_GRAY" "Port scan skipped."
   fi

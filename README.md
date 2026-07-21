@@ -44,6 +44,8 @@ scanlan
 
 - Keep `Skip` selected to omit the port scan, or mark individual IP addresses or `Select all discovered IPs`.
 
+- Select the 100 most common ports, the 1,000 most common ports, or all 65,535 TCP ports.
+
 ![Step 3](.img/3TQpI7JHzYaNoqjc48cpw.png)
 
 - Start the optional TCP port scans with Enter.
@@ -59,7 +61,7 @@ scanlan
 7. Shows live host counts and timeout countdowns.
 8. Displays IP, MAC address, and vendor results.
 9. Preselects `Skip` and lets you select multiple discovered IP addresses instead.
-10. Scans the 1,000 most common TCP ports on each selected IP.
+10. Lets you scan the 100 most common, 1,000 most common, or all 65,535 TCP ports on each selected IP.
 11. Displays all open ports in one table.
 
 The host discovery step does not scan ports. Port scanning only runs after you select discovered IP addresses.
