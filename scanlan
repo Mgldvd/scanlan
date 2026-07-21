@@ -803,8 +803,8 @@ print_combined_port_scan_report() {
     "Hosts scanned: $host_total · TCP ports: $scope_label · Max time per host: ${MAXTIME}s"
   echo
   print_table \
-    "HOST|PORT|PROTOCOL|STATE|SERVICE" \
-    "18|10|12|18|28" \
+    "HOST|PORT|IP:PORT|PROTOCOL|STATE|SERVICE" \
+    "18|10|24|12|18|28" \
     < "$ALL_PORT_SCAN_FILE"
 }
 
@@ -894,27 +894,29 @@ if [[ -s "$DISCOVERED_HOSTS_FILE" ]]; then
 
       PORT_SCAN_RESULT="$(cat "$PORT_SCAN_STATUS_FILE")"
       if [[ -s "$ALL_PORT_SCAN_FILE" ]]; then
-        printf '%s\n' '||||' >> "$ALL_PORT_SCAN_FILE"
+        printf '%s\n' '|||||' >> "$ALL_PORT_SCAN_FILE"
       fi
 
       if [[ -s "$PORT_SCAN_FILE" ]]; then
-        awk -v ip="$SELECTED_IP" '{print ip "|" $0}' "$PORT_SCAN_FILE" \
+        awk -F '|' -v ip="$SELECTED_IP" \
+          '{print ip "|" $1 "|" ip ":" $1 "|" $2 "|" $3 "|" $4}' \
+          "$PORT_SCAN_FILE" \
           >> "$ALL_PORT_SCAN_FILE"
       fi
 
       case "$PORT_SCAN_RESULT" in
         ok)
           if [[ ! -s "$PORT_SCAN_FILE" ]]; then
-            printf '%s|-|-|NO OPEN PORTS|-\n' "$SELECTED_IP" \
+            printf '%s|-|-|-|NO OPEN PORTS|-\n' "$SELECTED_IP" \
               >> "$ALL_PORT_SCAN_FILE"
           fi
           ;;
         timeout)
-          printf '%s|-|-|TIMEOUT|-\n' "$SELECTED_IP" \
+          printf '%s|-|-|-|TIMEOUT|-\n' "$SELECTED_IP" \
             >> "$ALL_PORT_SCAN_FILE"
           ;;
         error:*)
-          printf '%s|-|-|ERROR %s|-\n' \
+          printf '%s|-|-|-|ERROR %s|-\n' \
             "$SELECTED_IP" "${PORT_SCAN_RESULT#error:}" \
             >> "$ALL_PORT_SCAN_FILE"
           ;;
